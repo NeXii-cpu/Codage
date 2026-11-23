@@ -4,20 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FPS 3D - Nuketown</title>
-<style>
-body{margin:0;overflow:hidden;font-family:'Segoe UI',sans-serif;user-select:none}
-#info{position:fixed;top:15px;left:15px;color:#fff;background:rgba(0,0,0,.7);padding:12px 18px;border-radius:8px;font-size:1.1rem;border-left:4px solid #00ff88}
-#viseur{position:fixed;top:50%;left:50%;width:12px;height:12px;margin:-6px 0 0 -6px;border:2px solid #00ff88;border-radius:50%;pointer-events:none}
-#degats{position:fixed;inset:0;pointer-events:none;background:rgba(255,0,0,.4);opacity:0;transition:opacity .2s}
-#hit-marker{position:fixed;top:45%;left:50%;transform:translate(-50%,-50%);color:#fc0;font-weight:bold;font-size:1.4rem;pointer-events:none;opacity:0;transition:opacity .15s;text-shadow:2px 2px 4px #000}
-#menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.8);color:#fff;text-align:center;cursor:pointer;font-size:1.3rem;line-height:1.6}
-#info,#viseur,#hit-marker{z-index:3}
-#degats{z-index:4}
-#vignette{position:fixed;inset:0;z-index:2;pointer-events:none;background:radial-gradient(ellipse at center,transparent 35%,rgba(2,4,9,.24) 72%,rgba(2,4,9,.64) 120%)}
-#menu{z-index:6}
-.bt{display:inline-block;margin:6px;padding:10px 20px;border-radius:8px;background:#00ff88;color:#000;font-weight:bold;cursor:pointer}.bt.q{background:#444;color:#fff;padding:6px 12px}.bt.on{outline:3px solid #fff}
-#boss-ligne{color:#ff8a80;font-weight:bold}
-</style>
+<link rel="stylesheet" href="style.css">
 <script type="importmap">
 {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
 </script>
@@ -880,7 +867,7 @@ arme.add(corps, canon, poignee, flash);
 const POS_ARME = new THREE.Vector3(.28, -.22, -.55);
 arme.position.copy(POS_ARME);
 camera.add(arme);
-<! Ce bloc de code permet de faire apparaitre l'arme à l'écran. Comme on le voit l'arme est décomposé avec le corps, le canon, la poignée et la flash. Il est positionné à une position qui concorde par rapport à la caméra du joueur pour simuler la vue à la première personne. Le flash s'allume seulement lorsque le joueur tire. />
+//z Ce bloc de code permet de faire apparaitre l'arme à l'écran. Comme on le voit l'arme est décomposé avec le corps, le canon, la poignée et la flash. Il est positionné à une position qui concorde par rapport à la caméra du joueur pour simuler la vue à la première personne. Le flash s'allume seulement lorsque le joueur tire. />
 // ---------- Contrôles et menu ----------
 const controls = new PointerLockControls(camera, document.body);
 const menu = document.getElementById("menu"), menuTexte = document.getElementById("menuTexte");
