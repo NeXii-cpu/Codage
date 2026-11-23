@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FPS 3D - Nuketown</title>
+<style>
+body{margin:0;overflow:hidden;font-family:'Segoe UI',sans-serif;user-select:none}
+#info{position:fixed;top:15px;left:15px;color:#fff;background:rgba(0,0,0,.7);padding:12px 18px;border-radius:8px;font-size:1.1rem;border-left:4px solid #00ff88}
+#viseur{position:fixed;top:50%;left:50%;width:12px;height:12px;margin:-6px 0 0 -6px;border:2px solid #00ff88;border-radius:50%;pointer-events:none}
+#degats{position:fixed;inset:0;pointer-events:none;background:rgba(255,0,0,.4);opacity:0;transition:opacity .2s}
+#hit-marker{position:fixed;top:45%;left:50%;transform:translate(-50%,-50%);color:#fc0;font-weight:bold;font-size:1.4rem;pointer-events:none;opacity:0;transition:opacity .15s;text-shadow:2px 2px 4px #000}
+#menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.8);color:#fff;text-align:center;cursor:pointer;font-size:1.3rem;line-height:1.6}
+#info,#viseur,#hit-marker{z-index:3}
+#degats{z-index:4}
+#vignette{position:fixed;inset:0;z-index:2;pointer-events:none;background:radial-gradient(ellipse at center,transparent 35%,rgba(2,4,9,.24) 72%,rgba(2,4,9,.64) 120%)}
+#menu{z-index:6}
+.bt{display:inline-block;margin:6px;padding:10px 20px;border-radius:8px;background:#00ff88;color:#000;font-weight:bold;cursor:pointer}.bt.q{background:#444;color:#fff;padding:6px 12px}.bt.on{outline:3px solid #fff}
+#boss-ligne{color:#ff8a80;font-weight:bold}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="info">
+Score : <span id="score">0</span> | Record : <span id="highscore">0</span><br>
+<span id="nom-arme">Fusil</span> : <span id="munitions">30</span> / <span id="reserve">90</span> (<span id="etat-arme">Prêt</span>)<br>
+<span id="temps"></span> | Vies : <span id="vies">3</span><br>
+<span id="boss-ligne"></span>
+<small>FPS : <span id="fps">-</span></small>
+</div>
+<div id="viseur"></div><div id="hit-marker"></div><div id="degats"></div><div id="vignette"></div>
+<div id="menu"><div id="menuTexte"></div></div>
+
+<script type="module">
+import * as THREE from "three";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+
+// ---------- Audio ----------
+let ac = null;
+const initAudio = () => { ac = ac || new (window.AudioContext || window.webkitAudioContext)(); };
+function bip(type, f1, f2, dur, vol) {
+  if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+  o.type = type;
+  o.frequency.setValueAtTime(f1, t);
+  o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.01, t + dur);
+  o.connect(g); g.connect(ac.destination);
+  o.start(); o.stop(t + dur);
+}
+let bruit = null;
+function noise(dur, vol, fc) {
+  if (!ac) return;
+  if (!bruit) { bruit = ac.createBuffer(1, ac.sampleRate, ac.sampleRate); const d = bruit.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; }
+  const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain(), t = ac.currentTime;
+  s.buffer = bruit; f.type = "lowpass";
+  f.frequency.setValueAtTime(fc, t); f.frequency.exponentialRampToValueAtTime(100, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.01, t + dur);
+  s.connect(f); f.connect(g); g.connect(ac.destination); s.start(t); s.stop(t + dur);
+}
+const sonTir = () => { noise(.18, .5, 3500); bip("sine", 150, 40, .15, .5); };
+const sonPompe = () => { noise(.28, .65, 1800); bip("sawtooth", 90, 30, .22, .45); };
+const sonRecharge = () => { bip("square", 900, 500, .05, .12); setTimeout(() => bip("square", 500, 900, .06, .12), 700); setTimeout(() => noise(.08, .3, 2500), 1000); };
+const sonTouche = () => bip("triangle", 1200, 600, .07, .2);
+const sonDegat = () => bip("sawtooth", 120, 50, .25, .35);
+const sonBonus = () => bip("sine", 600, 1200, .18, .2);
+
+// ---------- Réglages ----------
+const DUREE = 90, VIES = 1, L = 50, HJ = 1.7, ETAGE = 3.2, CELL = .5, PC = 4;
+const lire = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } };
+const ecrire = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const lumieres = [];
+
+// ---------- Scène ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f18);
+scene.fog = new THREE.FogExp2(0x0e1219, .03);   // brouillard de nuit (réduit dans les maisons)
+let dansMaison = false;
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 250);
+scene.add(camera);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+let Q = +lire("nuketown_q", 1);
+function qualite(q) {
+  Q = q; ecrire("nuketown_q", q);
+  renderer.setPixelRatio([.6, 1, Math.min(devicePixelRatio, 2)][q]);
+  renderer.setSize(innerWidth, innerHeight);
+  scene.fog.density = dansMaison ? .002 : [.045, .03, .02][q];
+  camera.far = [90, 130, 250][q];
+  lumieres.forEach((l, i) => (l.visible = q > 0 || i % 2 === 0));
+  camera.updateProjectionMatrix();
+}
+qualite(Q);
+scene.add(new THREE.HemisphereLight(0x4a5a7a, 0x1a1a1a, .65));
+const lune = new THREE.DirectionalLight(0x8fa8ff, .7);
+lune.position.set(-30, 60, 20); scene.add(lune);
+const lampe = new THREE.SpotLight(0xfff1d0, 500, 45, .45, .6, 1.4);   // lampe torche (touche F)
+lampe.position.set(0, 0, 0); lampe.target.position.set(0, 0, -1);
+camera.add(lampe, lampe.target);
+const astre = new THREE.Mesh(new THREE.SphereGeometry(9, 16, 16), new THREE.MeshBasicMaterial({ color: 0xdfe8ff, fog: false }));
+astre.position.set(-120, 110, -160); scene.add(astre);
+const lumieresAmbiance = [];
+function ajouterLumiere(couleur, intensite, distance, x, y, z, variation = .08) {
+  const l = new THREE.PointLight(couleur, intensite, distance, 2);
+  l.userData = {
+    base: intensite,
+    scint: !!variation,
+    phase: Math.random() * Math.PI * 2,
+    phaseLente: Math.random() * Math.PI * 2,
+    vitesseScint: .7 + Math.random() * .9,
+    amplitudeScint: .025 + Math.random() * .045,
+    scintillementBref: 0,
+    prochainScintillement: 2 + Math.random() * 6
+  };
+  l.visible = Q > 0 || lumieres.length % 2 === 0;
+  l.position.set(x, y, z); scene.add(l);
+  lumieres.push(l);
+  lumieresAmbiance.push({ lumiere: l, intensite, variation, phase: Math.random() * Math.PI * 2 });
+  return l;
+}
+
+// ---------- Matériaux (textures dessinées par le code) ----------
+const cache = {};
+function mat(type, couleur, rx = 1, ry = 1) {
+  const k = type + couleur + rx + ry;
+  if (cache[k]) return cache[k];
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const g = c.getContext("2d");
+  g.fillStyle = couleur; g.fillRect(0, 0, 128, 128);
+  for (let i = 0; i < 600; i++) {
+    g.fillStyle = Math.random() < .5 ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.06)";
+    g.fillRect(Math.random() * 128, Math.random() * 128, 3, 3);
+  }
+  g.strokeStyle = "rgba(0,0,0,.3)"; g.lineWidth = 2;
+  const ligne = (a, b, c2, d) => { g.beginPath(); g.moveTo(a, b); g.lineTo(c2, d); g.stroke(); };
+  if (type === "bardage") for (let y = 0; y < 128; y += 12) ligne(0, y, 128, y);
+  else if (type === "toit") for (let y = 0; y < 128; y += 8) ligne(0, y, 128, y);
+  else if (type === "parquet" || type === "palissade") for (let x = 0; x < 128; x += 16) ligne(x, 0, x, 128);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(rx, ry);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return (cache[k] = new THREE.MeshStandardMaterial({ map: t }));
+}
+const cu = {};
+const uni = (c) => cu[c] || (cu[c] = new THREE.MeshStandardMaterial({ color: c }));
+const verre = new THREE.MeshStandardMaterial({ color: 0x9fd3ee, transparent: true, opacity: .35 });
+
+// ---------- Collisions ----------
+const obstacles = [], solides = [], maisons = [];
+// Grille spatiale : on ne teste que les obstacles proches
+const seaux = new Map(), VIDE = [];
+const cle = (ix, iz) => ix * 100 + iz;
+const cellule = (v) => Math.floor((v + L + 10) / PC);
+const proches = (x, z) => seaux.get(cle(cellule(x), cellule(z))) || VIDE;
+
+// sol = true : bloque joueur et tirs | "tir" : bloque seulement les tirs | false : décor
+function addBox(x, y, z, w, h, d, m, sol = true) {
+  const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+  b.position.set(x, y, z);
+  b.matrixAutoUpdate = false; b.updateMatrix(); // objet fixe : pas de recalcul à chaque image
+  scene.add(b);
+  if (sol) solides.push(b);
+  if (sol === true) {
+    const o = { minX: x - w / 2, maxX: x + w / 2, minY: y - h / 2, maxY: y + h / 2, minZ: z - d / 2, maxZ: z + d / 2 };
+    obstacles.push(o);
+    for (let ix = cellule(o.minX - 1.5); ix <= cellule(o.maxX + 1.5); ix++)
+      for (let iz = cellule(o.minZ - 1.5); iz <= cellule(o.maxZ + 1.5); iz++) {
+        const k = cle(ix, iz);
+        if (!seaux.has(k)) seaux.set(k, []);
+        seaux.get(k).push(o);
+      }
+  }
+  return b;
+}
+// fy = hauteur des pieds : un obstacle ne gêne que s'il est à la hauteur du corps
+function pousser(pos, r, fy, haut = 1.7) {
+  let touche = false;
+  for (const o of proches(pos.x, pos.z)) {
+    if (!(o.minY < fy + haut && o.maxY > fy + .25)) continue;
+    const cx = Math.max(o.minX, Math.min(pos.x, o.maxX));
+    const cz = Math.max(o.minZ, Math.min(pos.z, o.maxZ));
+    const dx = pos.x - cx, dz = pos.z - cz, d = Math.hypot(dx, dz);
+    if (d < r) {
+      touche = true;
+      if (d > .0001) { pos.x = cx + dx / d * r; pos.z = cz + dz / d * r; }
+      else {
+        const m = Math.min(pos.x - o.minX, o.maxX - pos.x, pos.z - o.minZ, o.maxZ - pos.z);
+        if (m === pos.x - o.minX) pos.x = o.minX - r;
+        else if (m === o.maxX - pos.x) pos.x = o.maxX + r;
+        else if (m === pos.z - o.minZ) pos.z = o.minZ - r;
+        else pos.z = o.maxZ + r;
+      }
+    }
+  }
+  return touche;
+}
+const libre = (x, z, mg, fy = 0) => !proches(x, z).some((o) =>
+  o.minY < fy + 1.7 && o.maxY > fy + .35 && x > o.minX - mg && x < o.maxX + mg && z > o.minZ - mg && z < o.maxZ + mg);
+
+const maisonDe = (x, z) => maisons.find((m) => Math.abs(x - m.cx) < 10 && Math.abs((z - m.zc) * m.s) < 7);
+const interieurDe = (x, z) => maisons.find((m) => Math.abs(x - m.cx) < 9.5 && Math.abs((z - m.zc) * m.s) < 6.5);
+
+// Hauteur du sol : escalier (rampe), étage, ou rez-de-chaussée
+function hauteurSol(x, z, fy) {
+  let h = 0;
+  for (const m of maisons) {
+    const lx = x - m.cx, lf = (z - m.zc) * m.s;
+    if (Math.abs(lx) < 10 && Math.abs(lf) < 7) {
+      if (lx > 7 && lf < 2) { if (lf > -6) h = Math.max(h, (lf + 6) / 8 * ETAGE); }
+      else if (fy > ETAGE - .8) h = ETAGE;
+    }
+  }
+  return h;
+}
+
+// ---------- Terrain ----------
+const sol = new THREE.Mesh(new THREE.PlaneGeometry(2 * L + 40, 2 * L + 40), mat("herbe", "#558b2f", 30, 30));
+sol.rotation.x = -Math.PI / 2; scene.add(sol);
+const route = new THREE.Mesh(new THREE.PlaneGeometry(2 * L, 16), mat("asphalte", "#37474f", 12, 2));
+route.rotation.x = -Math.PI / 2; route.position.y = .02; scene.add(route);
+for (let x = -L + 4; x < L; x += 8) {
+  const l = new THREE.Mesh(new THREE.PlaneGeometry(4, .4), new THREE.MeshBasicMaterial({ color: 0xffeb3b }));
+  l.rotation.x = -Math.PI / 2; l.position.set(x, .03, 0); scene.add(l);
+}
+[-9, 9].forEach((z) => addBox(0, .05, z, 2 * L, .1, 2, uni(0xb0b0b0), false)); // trottoirs
+
+// Palissade autour de la carte
+const bordure = mat("palissade", "#8d6e63", 20, 1);
+addBox(0, 1.75, -L - .25, 2 * L + 1, 3.5, .5, bordure);
+addBox(0, 1.75, L + .25, 2 * L + 1, 3.5, .5, bordure);
+addBox(-L - .25, 1.75, 0, .5, 3.5, 2 * L + 1, bordure);
+addBox(L + .25, 1.75, 0, .5, 3.5, 2 * L + 1, bordure);
+
+// ---------- Maisons à étage ----------
+// s = +1 : façade vers +z (maison nord) | s = -1 : façade vers -z (maison sud)
+// lx = position sur la largeur, lf = distance depuis le centre vers la façade
+function maison(cx, zc, s, cMur, cToit, cInt) {
+  maisons.push({ cx, zc, s });
+  const W = 20, D = 14, E = .3, H = ETAGE;
+  const mur = mat("bardage", cMur, 5, 1.5), parq = mat("parquet", "#c9a77c", 5, 3), cl = mat("bardage", cInt, 3, 1);
+  const box = (lx, lf, y0, y1, sx, sf, mt, so = true) => addBox(cx + lx, (y0 + y1) / 2, zc + s * lf, sx, y1 - y0, sf, mt, so);
+
+  // Mur avec ouvertures [de, à, bas, haut, vitre] (hauteurs relatives à y0)
+  function murs(axe, fixe, a, b, y0, y1, ops, mt) {
+    const seg = (u, v, h0, h1) => {
+      if (v - u < .01 || h1 - h0 < .01) return;
+      axe === "x" ? box((u + v) / 2, fixe, h0, h1, v - u, E, mt) : box(fixe, (u + v) / 2, h0, h1, E, v - u, mt);
+    };
+    let cur = a;
+    for (const [u, v, bas, haut, vit] of ops.slice().sort((p, q) => p[0] - q[0])) {
+      seg(cur, u, y0, y1); seg(u, v, y0, y0 + bas); seg(u, v, y0 + haut, y1);
+      if (vit) axe === "x" ? box((u + v) / 2, fixe, y0 + bas, y0 + haut, v - u, .06, verre, false)
+                           : box(fixe, (u + v) / 2, y0 + bas, y0 + haut, .06, v - u, verre, false);
+      cur = v;
+    }
+    seg(cur, b, y0, y1);
+  }
+  const porte = (u, v) => [u, v, 0, 2.4, false], fen = (u, v) => [u, v, .9, 2.3, true];
+
+  // Façade, arrière et côtés (rez-de-chaussée puis étage)
+  [[0, H], [H, 2 * H]].forEach(([y0, y1], n) => {
+    murs("x", 7, -10, 10, y0, y1, n ? [fen(-8, -5), fen(-2, 2), fen(4, 6)] : [porte(-1, 1), fen(-8, -5), fen(4, 6)], mur);
+    murs("x", -7, -10, 10, y0, y1, n ? [fen(-8, -5), fen(2, 5)] : [porte(-2, 0), fen(-8, -5), fen(3, 6)], mur);
+    [-10, 10].forEach((lx) => murs("f", lx, -7, 7, y0, y1, [fen(-4, -1), fen(2, 5)], mur));
+  });
+
+  // Pièces du rez-de-chaussée
+  murs("f", -3, -7, 7, 0, H, [porte(-4, -2), porte(3, 5)], cl);
+  murs("x", 0, -10, -3, 0, H, [porte(-7.5, -5.5)], cl);
+  box(7, -1.5, 0, H, .2, 7, cl);                 // flanc de l'escalier (entrée par le bas)
+  // Pièces de l'étage
+  murs("x", 0, -10, 7, H, 2 * H, [porte(-7.5, -5.5), porte(2, 4)], cl);
+  murs("f", -1, -7, 0, H, 2 * H, [porte(-4.5, -2.5)], cl);
+  box(7, -2.5, H, H + 1, .1, 9, cl);             // rambarde autour de l'escalier
+
+  // Sols, plancher d'étage (trou pour l'escalier) et plafond
+  const sRdc = new THREE.Mesh(new THREE.PlaneGeometry(W - .6, D - .6), parq);
+  sRdc.rotation.x = -Math.PI / 2; sRdc.position.set(cx, .04, zc); scene.add(sRdc);
+  box(-1.5, 0, H - .2, H, 17, 14, parq, "tir");
+  box(8.5, 4.5, H - .2, H, 3, 5, parq, "tir");
+  box(0, 0, 2 * H, 2 * H + .2, W, D, uni(0xeeeeee), "tir");
+
+  const bois = uni(0x49372d), tissu = uni(0x4d5156), tissuClair = uni(0x777064);
+  const matelas = uni(0xaaa18d), metal = uni(0x33383a), eclat = uni(0xffc979);
+  const lit = (lx, lf, niveau, largeur = 2.2, longueur = 2.8) => {
+    box(lx, lf, niveau + .18, niveau + .48, largeur, longueur, bois);
+    box(lx, lf, niveau + .48, niveau + .7, largeur - .12, longueur - .12, matelas, false);
+    box(lx, lf + longueur * .28, niveau + .7, niveau + .78, largeur - .35, .5, uni(0xd3c9b4), false);
+    box(lx, lf + longueur / 2 - .06, niveau + .25, niveau + 1.35, largeur + .12, .14, bois, false);
+  };
+  const canape = (lx, lf) => {
+    box(lx, lf, .18, .48, 3.2, .95, bois);
+    box(lx, lf, .48, .88, 3, .82, tissu);
+    box(lx, lf + .36, .82, 1.38, 3, .2, tissu);
+    [-1.48, 1.48].forEach((dx) => box(lx + dx, lf, .5, 1.05, .24, 1.05, tissu));
+  };
+  const table = (lx, lf, niveau, largeur, profondeur) => {
+    box(lx, lf, niveau + .68, niveau + .84, largeur, profondeur, bois);
+    [-1, 1].forEach((dx) => [-1, 1].forEach((dz) =>
+      box(lx + dx * (largeur / 2 - .12), lf + dz * (profondeur / 2 - .12), niveau, niveau + .68, .14, .14, bois)));
+  };
+  const chaise = (lx, lf, niveau) => {
+    box(lx, lf, niveau + .42, niveau + .55, .58, .58, bois);
+    box(lx, lf + .24, niveau + .55, niveau + 1.12, .58, .12, tissu);
+    [-.21, .21].forEach((dx) => [-.21, .21].forEach((dz) =>
+      box(lx + dx, lf + dz, niveau, niveau + .42, .09, .09, bois)));
+  };
+  const commode = (lx, lf, niveau, largeur = 1.5) => {
+    box(lx, lf, niveau, niveau + 1.25, largeur, .55, bois);
+    [niveau + .42, niveau + .82].forEach((y) =>
+      box(lx, lf - .29, y, y + .05, largeur - .16, .035, tissuClair, false));
+  };
+  const etagere = (lx, lf, niveau, largeur = 1.6) => {
+    box(lx, lf, niveau, niveau + 1.9, largeur, .42, bois);
+    [niveau + .52, niveau + 1.08, niveau + 1.64].forEach((y) =>
+      box(lx, lf, y, y + .09, largeur, .48, bois, false));
+    [-.48, 0, .48].forEach((dx, i) =>
+      box(lx + dx, lf - .25, niveau + .84 + (i % 2) * .16, niveau + 1.25 + (i % 2) * .16, .22, .18,
+        [uni(0x75614a), uni(0x58636a), uni(0x776052)][i], false));
+  };
+
+  // Rez-de-chaussée, avant gauche : salon, meubles regroupés autour de la table basse.
+  canape(-5.4, 4.65);
+  table(-5.4, 2.8, 0, 1.35, .8);
+  commode(-5.4, -2.57, .08, 2.2);
+  box(-5.4, -2.53, 1.02, 2.17, 1.35, .12, metal, false);
+  box(-5.4, -2.45, 1.12, 1.95, .92, .04, uni(0x657c84), false);
+
+  // Rez-de-chaussée, avant droite : table et quatre chaises, hors du passage vers l'escalier.
+  table(4.6, 4.55, 0, 2.4, 1.25);
+  chaise(2.95, 4.55, 0); chaise(6.25, 4.55, 0);
+  chaise(4.6, 3.55, 0); chaise(4.6, 5.55, 0);
+
+  // Rez-de-chaussée, arrière droite : plan de travail le long du mur intérieur.
+  [-4.1, -5.25, -6.35].forEach((lf) => {
+    box(.85, lf, 0, .9, .92, .76, bois);
+    box(.85, lf, .9, 1.02, .98, .82, uni(0x777773), false);
+  });
+  box(2.05, -5.55, 0, 1.85, 1.05, 1.05, metal);
+  box(2.05, -5.55, 1.85, 2.02, 1.1, 1.1, bois, false);
+  box(.85, -4.1, 1.04, 1.22, .38, .28, uni(0x34383a), false);
+
+  // Rez-de-chaussée, arrière gauche : petite chambre, avec un dégagement devant la porte.
+  lit(-2.8, -5.35, 0, 2.15, 2.65);
+  commode(-6.9, -4.35, 0, 1.35);
+
+  // Étage, avant gauche : chambre et rangement contre les murs pleins.
+  lit(-5.25, 4.2, H);
+  commode(-1.35, 5.35, H, 1.35);
+
+  // Étage, arrière gauche : bureau, chaise et bibliothèque sans bloquer l'accès.
+  box(-4.1, -2.2, H + .68, H + .84, 2.2, .9, bois);
+  chaise(-4.1, -3.35, H);
+  etagere(-7.1, -3.8, H, 1.5);
+
+  // Étage, côté droit : chambre à l'avant et coin lecture à l'arrière, loin de la trémie.
+  lit(3.8, 4.45, H, 2.25, 2.7);
+  commode(8.7, 5.6, H, 1.45);
+  etagere(5.35, -4.5, H, 1.5);
+  chaise(2.5, -4.5, H);
+  table(2.5, -5.6, H, .65, .65);
+  box(2.5, -5.6, H + .86, H + 1.22, .28, .28, uni(0xffd79c), false);
+  [H - .42, 2 * H - .42].forEach((y) => {
+    box(0, 1, y, y + .1, .9, .65, metal, false);
+    box(0, 1, y + .1, y + .18, .42, .3, eclat, false);
+  });
+  ajouterLumiere(0xffb86b, 1.05, 10, cx, 2.75, zc + s * 1, .18);
+  ajouterLumiere(0xffc982, .8, 9, cx, H + 2.75, zc + s * 1, .14);
+
+  // Escalier : 16 marches, de lf = -6 à lf = +2
+  for (let i = 0; i < 16; i++) box(8.5, -6 + i * .5 + .25, 0, (i + 1) * .2, 2.8, .5, parq, "tir");
+
+  {
+    // ---- Lumières intérieures ----
+    ajouterLumiere(0xffd9a0, 70, 15, cx - 1, 2.7, zc, false);
+    ajouterLumiere(0xffd9a0, 60, 14, cx - 1, H + 2.7, zc, false);
+
+    // ---- Meubles : chaque pièce a ses limites, les portes et l'escalier restent dégagés ----
+    const bois = mat("parquet", "#8d5a2b"), blanc = uni(0xeceff1), tissu = uni(0x6d4c41), gris = uni(0x546e7a);
+    const mb = (lx, lf, y0, h, sx, sf, mt, so = true) => box(lx, lf, y0, y0 + h, sx, sf, mt, so);
+    const lit = (x, f, y0, c) => { mb(x, f, y0, .3, 1.7, 2.1, bois); mb(x, f, y0 + .3, .25, 1.6, 2, uni(c)); };
+    // Rez-de-chaussée : CUISINE (arrière gauche)
+    mb(-6.6, -6.35, 0, .9, 4.4, .9, blanc);            // plan de travail (fond)
+    mb(-9.35, -6.4, 0, 2, .8, .8, gris);               // frigo
+    mb(-9.35, -3.95, 0, .9, .9, 3.8, blanc);           // plan de travail (côté)
+    mb(-6, -3, 0, .9, 1.4, .9, bois);                  // îlot
+    // SALLE À MANGER (avant gauche)
+    mb(-6.5, 3.6, 0, .78, 1, 1.8, bois);               // table
+    [[-7.55, 3.1], [-7.55, 4.1], [-5.45, 3.1], [-5.45, 4.1], [-6.5, 2.3], [-6.5, 4.9]].forEach(([x, f]) => mb(x, f, 0, .5, .45, .45, bois));
+    mb(-9.5, 3.6, 0, .85, .6, 2.4, bois);              // buffet
+    mb(-6.5, 3.6, .05, .02, 2.8, 3.2, uni(0x8d3b3b), false);
+    // SALON (grande pièce de droite)
+    mb(-2.55, 0, 0, .5, .45, 2, bois); mb(-2.6, 0, .5, .7, .08, 1.3, uni(0x111111));   // meuble TV + télé
+    mb(1.6, 0, 0, .45, .9, 2.8, tissu); mb(2.1, 0, .45, .45, .25, 2.8, tissu);          // canapé
+    mb(.1, 0, 0, .4, .8, 1.5, bois);                   // table basse
+    mb(.2, -3.3, 0, .8, .9, .9, tissu);                // fauteuil
+    mb(3.5, -6.45, 0, .85, 1.8, .6, bois);             // commode
+    mb(-2.5, 6.5, 0, 1.8, .35, .35, bois);             // porte-manteau
+    mb(6.2, 6.4, 0, .9, .5, .5, uni(0x2e7d32));        // plante
+    mb(.4, 0, .05, .02, 4.2, 3.4, uni(0x37474f), false);
+    // Étage : CHAMBRE 1 (arrière gauche)
+    lit(-6.5, -5.75, H, 0x7986cb);
+    mb(-8.2, -6.5, H, .5, .5, .5, bois); mb(-4.8, -6.5, H, .5, .5, .5, bois);           // chevets
+    mb(-3.4, -.5, H, 2.1, 2.4, .55, bois);             // armoire
+    mb(-9.55, -2.5, H, .85, .5, 1.4, bois);            // commode
+    mb(-6.5, -3.9, H + .05, .02, 3, 2.4, uni(0x5d4037), false);
+    // SALLE DE BAIN (arrière droite)
+    mb(5.6, -6.35, H, .6, 1.7, .8, blanc);             // baignoire
+    mb(1.2, -6.3, H, .4, .45, .6, blanc); mb(1.2, -6.7, H, .8, .45, .2, blanc);         // WC
+    mb(2.8, -6.5, H, .85, .8, .5, blanc);              // lavabo
+    mb(-.45, -1.2, H, .85, .6, .6, gris);              // lave-linge
+    // CHAMBRE 2 + coin bureau (avant)
+    lit(-7.5, 5.75, H, 0xe57373);
+    mb(-9.5, 3.8, H, .85, .55, 1.4, bois); mb(-9.5, 1.15, H, 2.1, .55, 1.7, bois);       // commode + armoire
+    mb(-5.9, 6.5, H, .5, .5, .5, bois);                // chevet
+    mb(0, 6.3, H, .75, 1.8, .7, bois); mb(0, 5.4, H, .45, .45, .45, bois);              // bureau + chaise
+    mb(5.6, .45, H, 2, 1.6, .35, bois);                // bibliothèque
+    mb(5.2, 5.9, H, .8, .9, .9, tissu);                // fauteuil
+    mb(-2.5, 3.2, H, .45, 2.2, .9, tissu);             // petit canapé
+    mb(-7.5, 3.8, H + .05, .02, 3, 2.2, uni(0x5d4037), false);
+  }
+
+  // Toit à deux pans + pignons
+  const mt = mat("toit", cToit, 4, 2), a = Math.atan2(2.8, 10);
+  [-1, 1].forEach((k) => {
+    const p = new THREE.Mesh(new THREE.BoxGeometry(11, .25, D + 1.2), mt);
+    p.position.set(cx + k * 5, 2 * H + 1.6, zc);
+    p.rotation.z = -k * a;
+    scene.add(p);
+  });
+  const sh = new THREE.Shape(); sh.moveTo(-10, 0); sh.lineTo(10, 0); sh.lineTo(0, 2.8);
+  [-7, 7].forEach((lf) => {
+    const g = new THREE.Mesh(new THREE.ShapeGeometry(sh), new THREE.MeshStandardMaterial({ color: cMur, side: THREE.DoubleSide }));
+    g.position.set(cx, 2 * H + .2, zc + s * lf); scene.add(g);
+  });
+
+  // Jardin : allée, clôture avec portillon, clôtures latérales
+  box(0, 12, 0, .05, 2, 10, uni(0xbdbdbd), false);
+  const cloture = mat("palissade", "#e0d6c4", 6, 1);
+  box(-7.75, 16, 0, 1.2, 12.5, .2, cloture);
+  box(7.75, 16, 0, 1.2, 12.5, .2, cloture);
+  [-14, 14].forEach((lx) => box(lx, -3.5, 0, 1.2, .2, 39, cloture));
+}
+maison(-6, -27, +1, "#c8e6c9", "#37474f", "#f1ede4");   // maison nord
+maison(6, 27, -1, "#bbdefb", "#4e342e", "#f1ede4");     // maison sud
+
+function roues(x, z, pts) {
+  pts.forEach(([dx, dz]) => {
+    const r = new THREE.Mesh(new THREE.CylinderGeometry(.5, .5, .3, 14), uni(0x111111));
+    r.rotation.x = Math.PI / 2; r.position.set(x + dx, .5, z + dz); scene.add(r);
+  });
+}
+function bus(x, z) {
+  addBox(x, 1.7, z, 10, 2.8, 2.8, uni(0xfbc02d));
+  [1.43, -1.43].forEach((dz) => addBox(x, 2.3, z + dz, 8.6, .9, .05, uni(0x90a4ae), false));
+  addBox(x, 1.0, z, 10.02, .2, 2.82, uni(0x333333), false);
+  roues(x, z, [[-3, 1.4], [3, 1.4], [-3, -1.4], [3, -1.4]]);
+}
+function voiture(x, z, c) {
+  addBox(x, .8, z, 4.5, 1, 2, uni(c));
+  addBox(x, 1.55, z, 2.4, .7, 1.8, uni(0xcfd8dc));
+  roues(x, z, [[-1.4, 1], [1.4, 1], [-1.4, -1], [1.4, -1]]);
+}
+bus(-8, 3.5);
+voiture(14, -4, 0xd32f2f); voiture(-24, 3.5, 0x1976d2); voiture(30, 3, 0x388e3c); voiture(-40, -3.5, 0x9e9e9e);
+[[-14, -9.5], [16, 9.5], [30, -6], [-32, 5], [40, -14], [-40, 14], [26, 16], [-26, -16]].forEach(([x, z]) =>
+  addBox(x, .8, z, 1.6, 1.6, 1.6, mat("bardage", "#795548")));
+[[-28, 0], [34, 0], [-44, -6], [44, 6]].forEach(([x, z]) => addBox(x, .5, z, 3, 1, .8, uni(0x9e9e9e)));
+// Ici  c'est au niveau de la carte. Le but est de mettre des bus au milieu de la route, et des voiture. Sa créer des protections pour le joueur et qu'il puisse faire tourner les zombies. Le code apporte des cylindre, donne une couleur et le positionne sur la carte. On voit les coordonnées x et z, c'est l'endroit ou ils sont placés.  
+// ---------- Arbres dans les jardins ----------
+function arbre(x, z) {
+  addBox(x, 1.2, z, .6, 2.4, .6, uni(0x5d4037));
+  const c = new THREE.Mesh(new THREE.SphereGeometry(2.2, 12, 12), uni(0x2e7d32));
+  c.position.set(x, 4.2, z); scene.add(c);
+}
+[[-14, -16], [14, 16], [-2, -42], [2, 42], [-22, -38], [22, 38], [8, -40], [-8, 40]].forEach(([x, z]) => arbre(x, z));
+
+// Bonus ramassables (soin, munitions, vitesse)
+const pickups = [];
+const COL_BONUS = { soin: 0x4caf50, munitions: 0xffc107, vitesse: 0x29b6f6 };
+function creerBonus(type, x, z, fy = 0) {
+  const c = COL_BONUS[type];
+  const m = new THREE.Mesh(new THREE.BoxGeometry(.42, .42, .42), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: .45 }));
+  m.position.set(x, fy + .55, z);
+  m.userData = { type, fy, x, z, mort: false };
+  scene.add(m);
+  pickups.push(m);
+}
+function placerBonusFixes() {
+  creerBonus("soin", -6, -22, 0);
+  creerBonus("soin", 6, 22, 0);
+  creerBonus("soin", -4, -27, ETAGE);
+  creerBonus("munitions", 8, 0, 0);
+  creerBonus("munitions", -8, -1.5, 0);
+  creerBonus("munitions", 9, 27, ETAGE);
+  creerBonus("vitesse", 0, -12, 0);
+  creerBonus("vitesse", 14, -1.5, 0);
+}
+placerBonusFixes();
+
+const lumLampe = new THREE.MeshBasicMaterial({ color: 0xffd180 });
+function lampadaire(x, z, allumee) {   // certains sont cassés
+  addBox(x, 2.1, z, .18, 4.2, .18, uni(0x455a64), false);
+  addBox(x, 4.25, z, .7, .18, .7, allumee ? lumLampe : uni(0x37474f), false);
+  if (allumee) ajouterLumiere(0xffb455, 180, 26, x, 4, z, true);
+}
+[-42, -22, 22, 42].forEach((x) => { lampadaire(x, -8.2, Math.abs(x) === 22); lampadaire(x, 8.2, Math.abs(x) === 22); });
+
+// Braseros : points de lumière qui vacillent dans les coins sombres
+function brasero(x, z) {
+  addBox(x, .45, z, .8, .9, .8, uni(0x37281c));
+  addBox(x, .95, z, .6, .18, .6, new THREE.MeshBasicMaterial({ color: 0xff7a1a }), false);
+  ajouterLumiere(0xff7a2a, 150, 20, x, 1.6, z, true);
+}
+[[-18, -10.5], [22, 10.5], [-12, -38]].forEach(([x, z]) => brasero(x, z));
+
+// Nouveaux lieux : hangar, épicerie, atelier, remises, conteneurs, parking
+function batiment(cx, cz, w, d, h, couleur, sens, porte, interieur) {   // sens = +1 : porte vers +z | -1 : vers -z
+  const m = mat("bardage", couleur, w / 4, 1), E = .3, zf = cz + sens * d / 2, z0 = cz - sens * d / 2, l = (w - porte) / 2, lw = (w - 3) / 2;
+  addBox(cx - w / 2, h / 2, cz, E, h, d, m); addBox(cx + w / 2, h / 2, cz, E, h, d, m);
+  addBox(cx - porte / 2 - l / 2, h / 2, zf, l, h, E, m); addBox(cx + porte / 2 + l / 2, h / 2, zf, l, h, E, m);
+  addBox(cx, (2.8 + h) / 2, zf, porte, h - 2.8, E, m);
+  addBox(cx, .45, z0, w, .9, E, m); addBox(cx, (2.3 + h) / 2, z0, w, h - 2.3, E, m);
+  addBox(cx - 1.5 - lw / 2, 1.6, z0, lw, 1.4, E, m); addBox(cx + 1.5 + lw / 2, 1.6, z0, lw, 1.4, E, m);
+  addBox(cx, 1.6, z0, 3, 1.4, .06, verre, false);
+  addBox(cx, h + .1, cz, w + .6, .2, d + .6, uni(0x455a64), "tir");
+  interieur(cx, cz);
+}
+const caisse = () => mat("bardage", "#795548"), etabli = () => mat("parquet", "#8d5a2b");
+batiment(-36, -30, 16, 10, 4.5, "#90a4ae", +1, 6, (x, z) => {            // hangar
+  voiture(x - 3, z - 1, 0xff7043);
+  [[6.8, -3.8], [5.1, -3.8], [-6.5, 3.2], [-6.5, 1.5]].forEach(([dx, dz]) => addBox(x + dx, .8, z + dz, 1.6, 1.6, 1.6, caisse()));
+  addBox(x + 1, .5, z - 4.3, 5, 1, 1, etabli());
+});
+batiment(-34, 30, 14, 9, 3.6, "#ffe0b2", -1, 4, (x, z) => {              // épicerie
+  addBox(x - 1, .9, z - 1, 8, 1.8, .6, etabli()); addBox(x - 1, .9, z + 1.5, 8, 1.8, .6, etabli());
+  addBox(x + 3.5, .5, z - 3.2, 4, 1, 1, uni(0xeceff1)); addBox(x + 6.2, 1, z + 2, 1, 2, 5, uni(0x546e7a));
+});
+batiment(36, 32, 12, 8, 3.6, "#c5e1a5", -1, 4, (x, z) => {               // atelier
+  voiture(x + 1, z + 1, 0x00897b); addBox(x - 4, .5, z + 2.8, 3, 1, 1, etabli());
+  addBox(x - 4.8, .5, z - 1.5, .8, 1, .8, uni(0x1565c0)); addBox(x - 4.8, .5, z - 2.6, .8, 1, .8, uni(0xc62828));
+});
+batiment(-15, -44, 5, 4, 3, "#8d6e63", +1, 2.2, (x, z) => addBox(x, .5, z - 1, 1.6, 1, .8, caisse()));   // remises
+batiment(15, 44, 5, 4, 3, "#8d6e63", -1, 2.2, (x, z) => addBox(x, .5, z + 1, 1.6, 1, .8, caisse()));
+const conteneur = (x, z, c, vert) => addBox(x, 1.3, z, vert ? 2.6 : 6, 2.6, vert ? 6 : 2.6, uni(c));
+[[22, -18, 0xc0392b], [30, -18, 0x2980b9], [26, -26, 0x27ae60, 1], [36, -25, 0xf39c12, 1], [30, -34, 0x7f8c8d], [40, -40, 0xc0392b]]
+  .forEach(([x, z, c, v]) => conteneur(x, z, c, v));
+addBox(22, 3.9, -18, 6, 2.6, 2.6, uni(0x8e44ad));
+voiture(28, 20, 0xff7043); voiture(36, 20, 0x455a64); voiture(44, 20, 0xfdd835);   // parking
+
+// Gravats éparpillés
+for (let i = 0; i < 70; i++) {
+  const x = (Math.random() * 2 - 1) * (L - 2), z = (Math.random() * 2 - 1) * (L - 2);
+  if (!libre(x, z, 1.5) || maisonDe(x, z)) continue;
+  addBox(x, .12, z, .3 + Math.random() * .9, .24, .3 + Math.random() * .9, uni(Math.random() < .5 ? 0x4a4a4a : 0x5b4a3a), false);
+}
+
+// Fumée qui dérive dehors (elle disparaît dans les maisons)
+const texFumee = (() => {
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const g = c.getContext("2d"), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, "rgba(255,255,255,.9)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+})();
+const NF = 160, posF = new Float32Array(NF * 3), baseY = [];
+for (let i = 0; i < NF; i++) { posF[i * 3] = (Math.random() * 2 - 1) * L; baseY[i] = .6 + Math.random() * 5; posF[i * 3 + 1] = baseY[i]; posF[i * 3 + 2] = (Math.random() * 2 - 1) * L; }
+const geoF = new THREE.BufferGeometry(); geoF.setAttribute("position", new THREE.BufferAttribute(posF, 3));
+const fumee = new THREE.Points(geoF, new THREE.PointsMaterial({ map: texFumee, size: 11, transparent: true, opacity: .16, depthWrite: false, color: 0x9aa0aa }));
+fumee.frustumCulled = false; scene.add(fumee);
+function animerFumee(dt) {
+  for (let i = 0; i < NF; i++) {
+    let x = posF[i * 3] + (.7 + (i % 5) * .15) * dt;
+    const z = posF[i * 3 + 2] + Math.sin(i + performance.now() / 6000) * .3 * dt;
+    if (x > L) x = -L;
+    posF[i * 3] = x; posF[i * 3 + 2] = z;
+    posF[i * 3 + 1] = maisonDe(x, z) ? -50 : baseY[i];
+  }
+  geoF.attributes.position.needsUpdate = true;
+}
+[[-18, -12], [20, 12], [36, -12], [-36, 12]].forEach(([x, z]) => addBox(x, .45, z, 1.2, .9, .45, uni(0x5d4037), false));
+[[0, -14], [0, 14]].forEach(([x, z]) => addBox(x, .55, z, 2.2, 1.1, .7, uni(0x78909c), false));
+voiture(-16, -5.5, 0xf57c00); voiture(22, 5, 0x6a1b9a);
+
+// Débris et postes abandonnés dans les terrains libres
+const rouille = uni(0x493d36), betonCasse = uni(0x57544d), metalBrule = uni(0x25282a);
+function barricade(x, z, sens = 1) {
+  addBox(x, .45, z, 4.8, .9, .65, betonCasse);
+  addBox(x - sens * 1.15, 1.05, z, .28, 1.25, .28, rouille);
+  addBox(x + sens * 1.15, 1.05, z, .28, 1.25, .28, rouille);
+  addBox(x, 1.15, z, 2.4, .16, .12, metalBrule, false);
+  [-2.7, 2.7].forEach((dx) => addBox(x + dx, .28, z + 1.1, 1.1, .55, .85, rouille));
+}
+barricade(-30, -25, -1);
+barricade(30, 27, 1);
+addBox(34, .7, -28, 3.2, 1.4, 2.1, metalBrule);
+addBox(34, 1.45, -28.1, 1.8, .65, 1.8, uni(0x34383a));
+addBox(34, 2.05, -28.1, 2.1, .16, 2.2, rouille, false);
+addBox(24, .45, -29, 1.4, .9, 1.2, rouille);
+addBox(26, .35, -30, 1.2, .7, 1, uni(0x75533b));
+
+const fogCanvas = document.createElement("canvas");
+fogCanvas.width = fogCanvas.height = 128;
+const fogContext = fogCanvas.getContext("2d");
+const fogGradient = fogContext.createRadialGradient(64, 64, 4, 64, 64, 62);
+fogGradient.addColorStop(0, "rgba(255,255,255,.7)");
+fogGradient.addColorStop(.45, "rgba(255,255,255,.32)");
+fogGradient.addColorStop(1, "rgba(255,255,255,0)");
+fogContext.fillStyle = fogGradient; fogContext.fillRect(0, 0, 128, 128);
+const fogTexture = new THREE.CanvasTexture(fogCanvas);
+const fogMaterial = new THREE.SpriteMaterial({ map: fogTexture, color: 0x8994a8, transparent: true, opacity: .36, depthWrite: false, fog: false });
+const nappesBrouillard = [];
+[[-38, -18], [-24, 12], [-9, -10], [7, 16], [20, -16], [38, 12], [-36, 34], [37, -36], [4, 42], [-4, -43]].forEach(([x, z], i) => {
+  for (let n = 0; n < 2; n++) {
+    const p = new THREE.Sprite(fogMaterial);
+    p.position.set(x + (n - .5) * 5, 1.2 + n * .8, z + (n - .5) * 2.4);
+    p.scale.set(15 + (i % 3) * 2, 5 + n * .7, 1);
+    scene.add(p);
+    nappesBrouillard.push({ sprite: p, x: p.position.x, y: p.position.y, z: p.position.z, phase: i * 2 + n });
+  }
+});
+
+const flammes = [];
+function feuEchappe(x, z) {
+  const flamme = new THREE.Mesh(
+    new THREE.ConeGeometry(.32, 1.1, 7),
+    new THREE.MeshBasicMaterial({ color: 0xff7438, transparent: true, opacity: .8, fog: false })
+  );
+  flamme.position.set(x, .75, z); scene.add(flamme);
+  const l = ajouterLumiere(0xff5c25, 1.6, 11, x, 1.2, z, .35);
+  flammes.push({ mesh: flamme, lumiere: l, phase: Math.random() * 6.28 });
+}
+feuEchappe(31.8, -29.2);
+feuEchappe(-33.5, -23.8);
+
+// ---------- Mannequins ----------
+const GM = { torse: new THREE.BoxGeometry(.6, .8, .3), tete: new THREE.SphereGeometry(.22, 12, 12), jambe: new THREE.BoxGeometry(.22, .8, .25), bras: new THREE.BoxGeometry(.15, .7, .15), arme: new THREE.BoxGeometry(.08, .1, .6) };
+function creerMannequin(couleur, type, bas = couleur, peau = 0xffcc80) {
+  const g = new THREE.Group(), h = uni(couleur), p = uni(peau), b = uni(bas);
+  const piece = (geo, m, x, y, parent) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, 0); parent.add(o); return o; };
+  const pivot = (x, y, parent) => { const o = new THREE.Group(); o.position.set(x, y, 0); parent.add(o); return o; };
+  const haut = pivot(0, .8, g);                               // tout le haut du corps pivote autour des hanches
+  piece(GM.torse, h, 0, .4, haut);
+  const tete = pivot(0, .65, haut); piece(GM.tete, p, 0, .4, tete);
+  const bg = pivot(-.4, .75, haut), bd = pivot(.4, .75, haut);  // épaules
+  piece(GM.bras, h, 0, -.35, bg); piece(GM.bras, h, 0, -.35, bd);
+  const jg = pivot(-.15, .8, g), jd = pivot(.15, .8, g);        // hanches
+  piece(GM.jambe, b, 0, -.4, jg); piece(GM.jambe, b, 0, -.4, jd);
+  g.userData = { type, rig: { haut, tete, bg, bd, jg, jd } };
+  return g;
+}
+// ---------- Zombies détaillés : visage, vêtements déchirés, casque + gilet + camouflage pour le militaire ----------
+const GZ = {
+  haut: new THREE.BoxGeometry(.13, .38, .13), avant: new THREE.BoxGeometry(.11, .36, .11), main: new THREE.BoxGeometry(.1, .12, .08),
+  pied: new THREE.BoxGeometry(.18, .08, .3), orbite: new THREE.SphereGeometry(.058, 8, 8), oeil: new THREE.SphereGeometry(.026, 6, 6),
+  nez: new THREE.BoxGeometry(.04, .07, .04), bouche: new THREE.BoxGeometry(.15, .05, .04), dent: new THREE.BoxGeometry(.018, .035, .018),
+  machoire: new THREE.BoxGeometry(.15, .06, .13), plaie: new THREE.BoxGeometry(.13, .1, .02), cheveu: new THREE.BoxGeometry(.11, .05, .11),
+  casque: new THREE.SphereGeometry(.27, 14, 8, 0, Math.PI * 2, 0, Math.PI / 2), gilet: new THREE.BoxGeometry(.66, .5, .38),
+  poche: new THREE.BoxGeometry(.14, .13, .07), tache: new THREE.BoxGeometry(.16, .18, .015)
+};
+const ZP = [0x7f8f6f, 0x8a9a78, 0x6f7f66, 0x93a083], ZV = [0x3b3f3a, 0x4b3f35, 0x2f3a45, 0x56503a];
+const mOeil = new THREE.MeshBasicMaterial({ color: 0xffe14d }), mOeilB = new THREE.MeshBasicMaterial({ color: 0xff2a2a });
+let camoMat = null;
+function camo() {   // texture de camouflage dessinée par le code
+  if (camoMat) return camoMat;
+  const c = document.createElement("canvas"); c.width = c.height = 64;
+  const g = c.getContext("2d"); g.fillStyle = "#4a5a34"; g.fillRect(0, 0, 64, 64);
+  ["#2f3a22", "#6b5a3a", "#1c2215"].forEach((col) => { g.fillStyle = col; for (let i = 0; i < 14; i++) { g.beginPath(); g.ellipse(Math.random() * 64, Math.random() * 64, 4 + Math.random() * 9, 3 + Math.random() * 6, Math.random() * 3, 0, 6.28); g.fill(); } });
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  return (camoMat = new THREE.MeshStandardMaterial({ map: t }));
+}
+function creerZombie(sorte, cfg) {
+  const r = Math.random, pick = (a) => a[(r() * a.length) | 0];
+  const mil = sorte === "militaire", armé = mil || sorte === "boss";
+  const peau = uni(sorte === "boss" ? 0xc79a94 : sorte === "petit" ? 0x9aa05f : pick(ZP));
+  const haut = mil ? camo() : uni(sorte === "normal" ? pick(ZV) : cfg[0]), bas = mil ? camo() : uni(cfg[1]);
+  const sang = uni(0x5a0d0d), noir = uni(0x100707), dent = uni(0xd8d2b8);
+  const g = new THREE.Group();
+  const piece = (geo, m, x, y, z, p) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); p.add(o); return o; };
+  const pivot = (x, y, p) => { const o = new THREE.Group(); o.position.set(x, y, 0); p.add(o); return o; };
+  const hp = pivot(0, .8, g);
+  piece(GM.torse, haut, 0, .4, 0, hp);
+  for (let i = 0; i < 3; i++) piece(GZ.tache, sang, (r() - .5) * .34, .2 + r() * .45, .152, hp);   // taches de sang
+  if (mil) {   // gilet pare-balles + poches
+    piece(GZ.gilet, uni(0x2b302d), 0, .45, 0, hp);
+    [-.2, 0, .2].forEach((x) => piece(GZ.poche, uni(0x3a352b), x, .28, .2, hp));
+  }
+  const tete = pivot(0, .65, hp);
+  piece(GM.tete, peau, 0, .4, 0, tete);
+  [-1, 1].forEach((s) => { piece(GZ.orbite, noir, s * .08, .44, .15, tete); piece(GZ.oeil, sorte === "boss" ? mOeilB : mOeil, s * .08, .44, .19, tete); });
+  piece(GZ.nez, noir, 0, .37, .2, tete); piece(GZ.bouche, sang, 0, .28, .185, tete);
+  [-.05, -.017, .017, .05].forEach((x) => { piece(GZ.dent, dent, x, .31, .2, tete); piece(GZ.dent, dent, x, .255, .2, tete); });
+  piece(GZ.machoire, peau, 0, .2, .14, tete);                                      // mâchoire pendante
+  piece(GZ.plaie, sang, (r() < .5 ? -1 : 1) * .12, .35, .17, tete);                // joue arrachée
+  if (mil) piece(GZ.casque, camo(), 0, .5, 0, tete);
+  else for (let i = 0; i < 3; i++) piece(GZ.cheveu, uni(0x1c1612), (r() - .5) * .2, .58, (r() - .5) * .15, tete);
+  const bras = (s) => {
+    const ep = pivot(s * .4, .75, hp); piece(GZ.haut, haut, 0, -.19, 0, ep);
+    const co = pivot(0, -.38, ep); co.rotation.x = armé ? -.1 : -.3 - r() * .5;      // coude plié
+    piece(GZ.avant, mil ? haut : peau, 0, -.18, 0, co); piece(GZ.main, mil ? uni(0x222222) : sang, 0, -.4, 0, co);
+    return [ep, co];
+  };
+  const [bg, cg] = bras(-1), [bd, cd] = bras(1);
+  const jambe = (s) => { const p = pivot(s * .15, .8, g); piece(GM.jambe, bas, 0, -.4, 0, p); piece(GZ.pied, uni(0x1b1713), 0, -.76, .05, p); return p; };
+  g.userData = { type: "ennemi", rig: { haut: hp, tete, bg, bd, jg: jambe(-1), jd: jambe(1), cg, cd } };
+  return g;
+}
+// Position libre : au sol, ou à l'étage de la maison "etage"
+function placer(dist, etage) {
+  for (let i = 0; i < 80; i++) {
+    let x, z, fy = 0;
+    if (etage) { x = etage.cx + Math.random() * 16 - 9.5; z = etage.zc + etage.s * (Math.random() * 12 - 6); fy = ETAGE; }
+    else { x = (Math.random() * 2 - 1) * (L - 4); z = (Math.random() * 2 - 1) * (L - 4); }
+    if (libre(x, z, 1, fy) && Math.hypot(x - camera.position.x, z - camera.position.z) > dist) return [x, z, fy];
+  }
+  return etage ? [etage.cx + 8.5, etage.zc + etage.s * 5, ETAGE] : [0, -2, 0];
+}
+const cibles = [], ennemis = [];
+function creerCible() {
+  const m = creerMannequin(0xff9800, "cible"), [x, z] = placer(10, null);
+  m.position.set(x, 0, z);
+  m.userData.vx = (Math.random() - .5) * 3; m.userData.vz = (Math.random() - .5) * 3;
+  scene.add(m); cibles.push(m);
+}
+// ---------- Animation des zombies ----------
+function initAnim(m, sorte) {   // chaque zombie reçoit sa propre "personnalité" de mouvement
+  const u = m.userData, r = Math.random, nrm = sorte === "normal", pet = sorte === "petit", mil = sorte === "militaire";
+  u.ph = r() * 6.28; u.s = r() * 100;
+  u.ff = (pet ? 1.4 : mil ? .9 : 1) * (.85 + r() * .3);            // rythme de pas
+  u.f1 = .7 + r() * 1.2; u.f2 = .5 + r(); u.f3 = .9 + r() * 1.2; u.f4 = .4 + r() * .8;   // fréquences du "bruit"
+  u.pen = mil ? .05 + r() * .05 : (pet ? .3 : .22) + r() * .15;    // buste penché en avant
+  u.bal = .7 + r() * .8;                                           // amplitude du balancement
+  u.dg = 1; u.dd = 1;
+  if (nrm) { if (r() < .5) u.dg = .45; else u.dd = .45; }          // une jambe qui traîne
+  u.ag = pet ? -1 - r() * .5 : mil ? -.2 : -1.25 - r() * .25; u.ad = u.ag;
+  if (nrm && r() < .35) { if (r() < .5) u.ag = -.35; else u.ad = -.35; }   // un bras qui pend
+  u.fl = pet ? 1.6 : 1;                                            // les petits agitent plus les bras
+  u.amp = 0; u.alea = 1 + r() * 4; u.ev = 0; u.evt = 0; u.rec = 0;
+}
+function animerZombie(e, dt, pas, vise) {
+  const u = e.userData, R = u.rig, t = performance.now() / 1000 + u.s;
+  u.ph += pas * 2.2 * u.ff;                                        // les jambes suivent la distance parcourue
+  u.amp += ((pas > 0 ? 1 : 0) - u.amp) * Math.min(1, dt * 6);
+  const a = u.amp, p = u.ph;
+  const n1 = Math.sin(t * u.f1) * Math.sin(t * u.f2 + 1.3), n2 = Math.sin(t * u.f3 + 2) * Math.sin(t * u.f4);   // bruits lents, jamais périodiques
+  u.alea -= dt;
+  if (u.alea <= 0) { u.alea = 3 + Math.random() * 5; u.ev = .7; u.evt = (Math.random() * 3) | 0; }   // à-coup aléatoire
+  u.ev = Math.max(0, u.ev - dt); u.rec = Math.max(0, u.rec - dt * 2);
+  const ev = u.ev > 0 ? Math.sin(Math.PI * (1 - u.ev / .7)) : 0;
+  R.jg.rotation.x = Math.sin(p) * .6 * a * u.dg - (u.dg < 1 ? .15 * a : 0);
+  R.jd.rotation.x = Math.sin(p + Math.PI + n2 * .3) * .6 * a * u.dd - (u.dd < 1 ? .15 * a : 0);
+  R.haut.position.y = .8 + Math.abs(Math.cos(p)) * .05 * a;       // petit rebond à chaque pas
+  R.haut.rotation.set(u.pen + n1 * .05 + (u.evt === 0 ? ev * .25 : 0) - u.rec * .15,
+    Math.sin(p) * .15 * a + n1 * .1, Math.sin(p) * .12 * a * u.bal + n2 * .04 + (u.evt === 2 ? ev * .3 : 0));
+  R.tete.rotation.set(n1 * .25 + (u.evt === 1 ? ev * .5 : 0), n2 * .4, n1 * .3);
+  const lev = u.evt === 0 ? ev * .6 : 0, f = u.fl;
+  R.bg.rotation.set(u.ag + Math.sin(p + 1) * .2 * a * f + n1 * .12 * f - lev, 0, .08 + n2 * .1);
+  R.bd.rotation.set(u.ad + Math.sin(p + 2.4) * .2 * a * f + n2 * .12 * f - lev, 0, -.08 - n1 * .1);
+  if (u.sorte === "militaire" || u.sorte === "boss") R.bd.rotation.set((vise ? -1.55 : -1.1) + n1 * .03 + u.rec * .4, 0, 0);
+}
+// Ce bloc a pour but de faire une animation d'une démarche au zombie. Faire que les éléments comme la tête, les bras et les jambes bougent. J'ai fais que les animations de mouvement soit aléatoire et différente -----------------
+
+function tirerType() {
+  const nv = mode === "vagues" ? vague : 1 + Math.floor(6 * difficulte());
+  const r = Math.random();
+  if (nv >= 4 && r < Math.min(.18, .04 * nv)) return "tank";
+  if (nv >= 3 && r < Math.min(.25, .05 * nv)) return "militaire";
+  if (nv >= 2 && r < Math.min(.5, .15 * nv + .1)) return "petit";
+  return "normal";
+}
+
+// Le but de cette partie est de faire que les énnemis apparaisent en fonction de la manche. Le petit apparait manche 2, le militaire manche 3, le tank manche 4 et le boss manche 5. ----------
+const CFG_ENN = {
+  normal: [0x546e3b, 0x3e3e3e, 1, 1, 150],
+  petit: [0xa88a2a, 0x4a3a2c, .7, 1.5, 30],
+  militaire: [0x7b1fa2, 0x2e2e2e, 1, .8, 390],
+  tank: [0x455a64, 0x263238, 1.4, .5, 420],
+  boss: [0xb71c1c, 0x212121, 2, .65, 1800]
+};
+function monterEnnemi(sorte, dist, mp) {
+  const cfg = CFG_ENN[sorte];
+  const m = creerZombie(sorte, cfg);
+  const [x, z, fy] = placer(dist, mp);
+  m.scale.setScalar(cfg[2]);
+  m.userData.sorte = sorte; m.userData.k = cfg[3]; m.userData.pv = cfg[4]; m.userData.pvMax = cfg[4];
+  m.userData.tir = 1 + Math.random() * 2;
+  if (sorte === "militaire" || sorte === "boss") {
+    const f = new THREE.Mesh(GM.arme, uni(0x111111));
+    f.rotation.x = Math.PI / 2; f.position.set(0, -.3, .05); m.userData.rig.cd.add(f);   // l'arme est tenue par l'avant-bras
+  }
+  initAnim(m, sorte === "boss" ? "militaire" : sorte === "tank" ? "normal" : sorte);
+  m.position.set(x, fy, z);
+  scene.add(m); ennemis.push(m);
+  return m;
+}
+function creerEnnemi() {
+  const mp = niveau ? maisonDe(camera.position.x, camera.position.z) : null;
+  monterEnnemi(tirerType(), mp ? 5 : 20, mp);
+  spawnes++;
+}
+function creerBoss() {
+  const mp = niveau ? maisonDe(camera.position.x, camera.position.z) : null;
+  monterEnnemi("boss", mp ? 8 : 24, mp);
+  montrer("BOSS !", 2200);
+}
+
+// ---------- Intelligence des ennemis : carte de chemins ----------
+const N = 2 * L / CELL, DX = [1, -1, 0, 0, 1, 1, -1, -1], DZ = [0, 0, 1, -1, 1, -1, 1, -1];
+function grille(fy) {   // cases où un ennemi (rayon .45) peut se tenir à ce niveau
+  const g = new Uint8Array(N * N);
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = -L + (i + .5) * CELL, z = -L + (j + .5) * CELL;
+    g[j * N + i] = libre(x, z, .45, fy) && Math.abs(hauteurSol(x, z, fy) - fy) < .3 ? 1 : 0;
+  }
+  return g;
+}
+const grilles = [grille(0), grille(ETAGE)];
+const champ = new Int32Array(N * N), file = new Int32Array(N * N);
+const cellDe = (v) => Math.floor((v + L) / CELL);
+function calculerChamp() {   // distance de chaque case jusqu'au joueur
+  const g = grilles[niveau];
+  champ.fill(-1);
+  const ci = cellDe(camera.position.x), cj = cellDe(camera.position.z);
+  let depart = -1;
+  for (let r = 0; r < 8 && depart < 0; r++)
+    for (let dj = -r; dj <= r && depart < 0; dj++)
+      for (let di = -r; di <= r; di++) {
+        const i = ci + di, j = cj + dj;
+        if (i >= 0 && j >= 0 && i < N && j < N && g[j * N + i]) { depart = j * N + i; break; }
+      }
+  if (depart < 0) return;
+  let tete = 0, fin2 = 0;
+  file[fin2++] = depart; champ[depart] = 0;
+  while (tete < fin2) {
+    const c = file[tete++], ci2 = c % N, cj2 = (c / N) | 0;
+    for (let k = 0; k < 8; k++) {
+      const i = ci2 + DX[k], j = cj2 + DZ[k];
+      if (i < 0 || j < 0 || i >= N || j >= N) continue;
+      const n = j * N + i;
+      if (!g[n] || champ[n] >= 0) continue;
+      if (DX[k] && DZ[k] && !(g[cj2 * N + i] && g[j * N + ci2])) continue; // pas de coin coupé
+      champ[n] = champ[c] + 1; file[fin2++] = n;
+    }
+  }
+}
+// Point à viser : la case voisine la plus proche du joueur (null = foncer tout droit)
+function prochainPoint(e) {
+  const g = grilles[niveau], ci = cellDe(e.position.x), cj = cellDe(e.position.z);
+  if (ci < 0 || cj < 0 || ci >= N || cj >= N) return null;
+  const c = cj * N + ci;
+  if (champ[c] >= 0 && champ[c] <= 5) return null;
+  let meilleur = -1, bd = champ[c] >= 0 ? champ[c] : 1e9;
+  for (let k = 0; k < 8; k++) {
+    const i = ci + DX[k], j = cj + DZ[k];
+    if (i < 0 || j < 0 || i >= N || j >= N) continue;
+    const n = j * N + i;
+    if (champ[n] < 0 || champ[n] >= bd) continue;
+    if (DX[k] && DZ[k] && !(g[cj * N + i] && g[j * N + ci])) continue;
+    bd = champ[n]; meilleur = n;
+  }
+  return meilleur < 0 ? null : [-L + ((meilleur % N) + .5) * CELL, -L + (((meilleur / N) | 0) + .5) * CELL];
+}
+
+// ---------- Arme ----------
+const arme = new THREE.Group();
+const corps = new THREE.Mesh(new THREE.BoxGeometry(.12, .15, .5), uni(0x212121));
+const canon = new THREE.Mesh(new THREE.CylinderGeometry(.03, .03, .4, 12), uni(0x424242));
+canon.rotation.x = Math.PI / 2; canon.position.set(0, .03, -.4);
+const poignee = new THREE.Mesh(new THREE.BoxGeometry(.1, .2, .1), uni(0x3e2723));
+poignee.position.set(0, -.15, .1);
+const flash = new THREE.Mesh(new THREE.SphereGeometry(.08, 8, 8), new THREE.MeshBasicMaterial({ color: 0xffd54f }));
+flash.position.set(0, .03, -.62); flash.visible = false;
+arme.add(corps, canon, poignee, flash);
+const POS_ARME = new THREE.Vector3(.28, -.22, -.55);
+arme.position.copy(POS_ARME);
+camera.add(arme);
+<! Ce bloc de code permet de faire apparaitre l'arme à l'écran. Comme on le voit l'arme est décomposé avec le corps, le canon, la poignée et la flash. Il est positionné à une position qui concorde par rapport à la caméra du joueur pour simuler la vue à la première personne. Le flash s'allume seulement lorsque le joueur tire. />
+// ---------- Contrôles et menu ----------
+const controls = new PointerLockControls(camera, document.body);
+const menu = document.getElementById("menu"), menuTexte = document.getElementById("menuTexte");
+const degats = document.getElementById("degats"), hitEl = document.getElementById("hit-marker");
+let mode = "chrono", tricheInvincible = false, tricheMunitions = false, menuTricheOuvert = false;
+function ecranMenu(titre, enCours) {
+  const rec = lire("nuketown_highscore", 0), recS = lire("nuketown_survie", 0);
+  menuTexte.innerHTML = `<b>${titre}</b><br>
+  ${enCours ? '<span class="bt" data-act="reprendre">Reprendre</span><br>' : ""}
+  <span class="bt" data-act="chrono">Chronométré (${DUREE} s) · record ${rec}</span><br>
+  <span class="bt" data-act="vagues">Survie par vagues · record ${recS}</span><br><br>
+  <small>Z/W avancer · S reculer · Q/A gauche · D droite · Clic tirer · R recharger<br>
+  Espace : sauter · Shift : sprinter · Ctrl/C : s'accroupir · 1/2 : armes · F : lampe torche<br>
+  L'escalier est au fond à droite de chaque maison. Cubes colorés : soin, munitions, vitesse.<br>
+  En lambeaux : normal · jaune : rapide · camouflage et casque : tireur · gris : tank · rouge : boss</small><br><br>
+  Qualité :
+  ${["Basse", "Moyenne", "Haute"].map((n, i) => `<span class="bt q${i === Q ? " on" : ""}" data-q="${i}">${n}</span>`).join("")}<br><br>
+  <a href="index.html" style="color:#00ff88">Retour à l'accueil</a>`;
+}
+function afficherMenuTriche() {
+  menuTexte.innerHTML = `<b>Menu secret</b><br>
+  <small>Activez ou désactivez les options avec la souris.</small><br><br>
+  <span class="bt${tricheInvincible ? " on" : ""}" data-triche="invincible" role="button" aria-pressed="${tricheInvincible}">Invincibilité : ${tricheInvincible ? "activée" : "désactivée"}</span><br>
+  <span class="bt${tricheMunitions ? " on" : ""}" data-triche="munitions" role="button" aria-pressed="${tricheMunitions}">Munitions illimitées : ${tricheMunitions ? "activées" : "désactivées"}</span><br><br>
+  <span class="bt" data-action-triche="reprendre" role="button">Reprendre la partie</span><br>
+  <small>Appuyez simultanément sur M + P pour ouvrir ce menu pendant la partie.</small>`;
+}
+ecranMenu("NUKETOWN 3D", false);
+menu.addEventListener("click", (e) => {
+  const t = e.target;
+  if (t.tagName === "A") return;
+  if (menuTricheOuvert) {
+    if (t.dataset.triche === "invincible") tricheInvincible = !tricheInvincible;
+    else if (t.dataset.triche === "munitions") tricheMunitions = !tricheMunitions;
+    else if (t.dataset.actionTriche === "reprendre") {
+      menuTricheOuvert = false;
+      controls.lock();
+      return;
+    } else return;
+    afficherMenuTriche();
+    afficher();
+    return;
+  }
+  if (t.dataset.q !== undefined) { qualite(+t.dataset.q); ecranMenu(fin ? "NUKETOWN 3D" : "Pause", !fin); return; }
+  const act = t.dataset.act;
+  if (!act) return;
+  initAudio();
+  if (act !== "reprendre") { mode = act; reinitialiser(); }
+  controls.lock();
+});
+controls.addEventListener("lock", () => (menu.style.display = "none"));
+controls.addEventListener("unlock", () => {
+  clicMaintenu = false; menu.style.display = "flex";
+  if (menuTricheOuvert) afficherMenuTriche();
+  else if (!fin) ecranMenu("Pause", true);
+});
+
+const touches = {};
+let comboTricheDeclenche = false;
+function enTrainDeCourir() {
+  return touches["shift"] && !touches["control"] && !touches["c"] &&
+    (touches["z"] || touches["w"] || touches["s"] || touches["q"] || touches["a"] || touches["d"]);
+}
+document.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (["z", "q", "s", "d", "r", "w", "a", " ", "control", "shift", "c", "1", "2"].includes(k)) e.preventDefault();
+  touches[k] = true;
+  if (touches["m"] && touches["p"] && !comboTricheDeclenche) {
+    comboTricheDeclenche = true;
+    if (controls.isLocked && !fin) {
+      menuTricheOuvert = true;
+      controls.unlock();
+    }
+  }
+  if (k === "f") lampe.visible = !lampe.visible;
+  if (k === "1") changerArme(0);
+  if (k === "2") changerArme(1);
+  if (k === "r" && !tricheMunitions && !enRechargement && chargeurs[armeIdx] < ARMES[armeIdx].mag && reserves[armeIdx] > 0 && !fin) lancerRechargement();
+});
+document.addEventListener("keyup", (e) => {
+  const k = e.key.toLowerCase();
+  touches[k] = false;
+  if (k === "m" || k === "p") comboTricheDeclenche = false;
+});
+addEventListener("blur", () => { for (const k in touches) touches[k] = false; comboTricheDeclenche = false; });
+
+// ---------- État du jeu ----------
+let score = 0, vies = VIES, temps = DUREE, fin = true, niveau = 0;
+let enRechargement = false, delaiEnnemi = 0, debutRecharge = 0;
+let vague = 1, spawnes = 0, tues = 0, pauseVague = 0, champT = 0, bossCetteVague = false;
+let hCam = HJ, vy = 0, auSol = true, boostVit = 0, armeIdx = 0, dernierTir = 0, clicMaintenu = false, poseCourse = 0, phaseCourse = 0;
+const ARMES = [
+  { nom: "Fusil", mag: 30, dmg: 100, dmgTete: 250, delay: .11, recul: .08, pellets: 1, spread: 0, auto: true },
+  { nom: "Pompe", mag: 6, dmg: 38, dmgTete: 60, delay: .78, recul: .24, pellets: 7, spread: .052, auto: false }
+];
+let chargeurs = [30, 6], reserves = [90, 18];
+function changerArme(i) {
+  if (fin || i === armeIdx) return;
+  armeIdx = i; enRechargement = false; $("etat-arme").textContent = "Prêt"; afficher();
+}
+let record = +lire("nuketown_highscore", 0);
+const $ = (id) => document.getElementById(id);
+const maj = (id, v) => { const el = $(id); if (el._v !== v) { el.textContent = v; el._v = v; } };
+const cleRecord = () => (mode === "vagues" ? "nuketown_survie" : "nuketown_highscore");
+const nbVague = () => 4 + 3 * vague;   // ennemis à éliminer dans la vague
+const difficulte = () => (mode === "vagues" ? Math.min(1, (vague - 1) / 8) : (DUREE - temps) / DUREE);
+let tBanniere;
+function montrer(txt, ms = 1500) {
+  hitEl.textContent = txt; hitEl.style.opacity = 1;
+  clearTimeout(tBanniere); tBanniere = setTimeout(() => (hitEl.style.opacity = 0), ms);
+}
+function afficher() {
+  maj("score", score); maj("highscore", record); maj("vies", vies);
+  maj("munitions", tricheMunitions ? "∞" : chargeurs[armeIdx]);
+  maj("reserve", tricheMunitions ? "∞" : reserves[armeIdx]); maj("nom-arme", ARMES[armeIdx].nom);
+  maj("temps", mode === "vagues" ? "Vague " + vague + " (" + (nbVague() - tues) + " restants)" : "Temps : " + Math.ceil(temps) + " s");
+  const boss = ennemis.find((e) => e.userData.sorte === "boss");
+  maj("boss-ligne", boss ? "⚠ BOSS" : "");
+}
+function reinitialiser() {
+  [...cibles, ...ennemis].forEach((o) => scene.remove(o));
+  cibles.length = 0; ennemis.length = 0;
+  projectiles.forEach((b) => scene.remove(b)); projectiles.length = 0;
+  cadavres.forEach((c) => scene.remove(c)); cadavres.length = 0;
+  score = 0; vies = VIES; temps = DUREE; fin = false; niveau = 0;
+  vague = 1; spawnes = 0; tues = 0; pauseVague = 0; champT = 0; bossCetteVague = false;
+  delaiEnnemi = 2; enRechargement = false;
+  armeIdx = 0; chargeurs = [30, 6]; reserves = [90, 18];
+  hCam = HJ; vy = 0; auSol = true; boostVit = 0; clicMaintenu = false; poseCourse = 0; phaseCourse = 0;
+  record = +lire(cleRecord(), 0);
+  $("etat-arme").textContent = "Prêt";
+  camera.position.set(2, HJ, -2);
+  if (mode === "chrono") for (let i = 0; i < 8; i++) creerCible();
+  afficher();
+  if (mode === "vagues") montrer("VAGUE 1 !");
+}
+function terminer(raison) {
+  fin = true;
+  const nouveau = score > record;
+  if (nouveau) { record = score; ecrire(cleRecord(), score); }
+  ecranMenu(`${raison}<br>Score : ${score}${mode === "vagues" ? " · Vague " + vague : ""} · ${nouveau ? "NOUVEAU RECORD !" : "Record : " + record}`, false);
+  controls.unlock();
+}
+afficher();
+
+function lancerRechargement() {
+  const A = ARMES[armeIdx];
+  if (tricheMunitions || reserves[armeIdx] <= 0 || chargeurs[armeIdx] >= A.mag) return;
+  enRechargement = true; debutRecharge = performance.now(); $("etat-arme").textContent = "Rechargement..."; sonRecharge();
+  setTimeout(() => {
+    if (!fin) {
+      const manque = A.mag - chargeurs[armeIdx], pris = Math.min(manque, reserves[armeIdx]);
+      chargeurs[armeIdx] += pris; reserves[armeIdx] -= pris;
+      $("etat-arme").textContent = "Prêt"; afficher();
+    }
+    enRechargement = false;
+  }, 1200);
+}
+
+// ---------- Tir ----------
+const raycaster = new THREE.Raycaster();
+let recul = 0;
+// Impacts sur les murs : 40 marques réutilisées en boucle
+const impacts = [], matImpact = new THREE.MeshBasicMaterial({ color: 0x111111 }), geoImpact = new THREE.CircleGeometry(.09, 8);
+let iImpact = 0, tFlash = 0;
+function impact(t) {
+  const k = iImpact++ % 40;
+  if (!impacts[k]) { impacts[k] = new THREE.Mesh(geoImpact, matImpact); scene.add(impacts[k]); }
+  const n = t.face.normal.clone().transformDirection(t.object.matrixWorld), d = impacts[k];
+  d.position.copy(t.point).addScaledVector(n, .02);
+  d.lookAt(t.point.clone().add(n));
+}
+// Projectiles des zombies militaires : boules roses lumineuses, lentes (13 u/s contre 8 pour toi de course... esquivables)
+const projectiles = [], geoBalle = new THREE.SphereGeometry(.22, 10, 10), geoHalo = new THREE.SphereGeometry(.5, 10, 10);
+const matBalle = new THREE.MeshBasicMaterial({ color: 0xff2bd6, fog: false });
+const matHalo = new THREE.MeshBasicMaterial({ color: 0xff2bd6, transparent: true, opacity: .3, fog: false });
+function tirerBalle(o, dir) {
+  const b = new THREE.Mesh(geoBalle, matBalle);
+  b.add(new THREE.Mesh(geoHalo, matHalo));
+  b.position.copy(o);
+  b.userData = { v: dir.clone().multiplyScalar(13), vie: 4 };
+  scene.add(b); projectiles.push(b);
+  bip("square", 600, 200, .12, .15);
+}
+function blesser() {   // renvoie true si la partie est finie
+  if (tricheInvincible) return false;
+  vies--; sonDegat();
+  degats.style.opacity = 1; setTimeout(() => (degats.style.opacity = 0), 150);
+  if (vies <= 0) { afficher(); terminer("Tu as été éliminé !"); return true; }
+  return false;
+}
+function tuerCible(obj, tete) {
+  scene.remove(obj);
+  cibles.splice(cibles.indexOf(obj), 1);
+  const pts = tete ? 100 : 50;
+  score += pts; sonTouche(); creerCible();
+  montrer((tete ? "HEADSHOT +" : "CORPS +") + pts, 200);
+}
+const cadavres = [], qCh = new THREE.Quaternion(), axeCh = new THREE.Vector3();
+function mourir(obj, tete) {   // le zombie devient un ragdoll qui reste 20 s
+  ennemis.splice(ennemis.indexOf(obj), 1); tues++;
+  const R = obj.userData.rig, r = Math.random;
+  let dx = obj.position.x - camera.position.x, dz = obj.position.z - camera.position.z;
+  const l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;                // il tombe en s'éloignant du joueur
+  const membres = ["bg", "bd", "jg", "jd", "cg", "cd", "tete"].map((k) => ({
+    o: R[k], x0: R[k].rotation.x, z0: R[k].rotation.z, xr: (r() - .5) * 2.4, zr: (r() - .5) * 1.2, f: 7 + r() * 5 }));
+  membres[6].xr = tete ? -1.1 : .6 + r() * .5;                        // tête renversée si headshot
+  obj.userData.mort = { t: 0, dx, dz, ang: 0, vel: 1.2 + r() * 1.2, max: 1.45 + r() * .1, yaw: obj.quaternion.clone(), y0: obj.position.y, s0: obj.scale.x, membres };
+  cadavres.push(obj);
+  if (cadavres.length > 30) scene.remove(cadavres.shift());
+}
+function animerCadavres(dt) {
+  for (let i = cadavres.length - 1; i >= 0; i--) {
+    const o = cadavres[i], m = o.userData.mort;
+    m.t += dt;
+    if (m.t > 20) { scene.remove(o); cadavres.splice(i, 1); continue; }
+    if (!m.fini) {   // chute : le corps bascule, rebondit un peu, puis reste au sol
+      m.vel += 16 * dt * Math.sin(Math.min(m.ang + .25, 1.57));
+      m.ang += m.vel * dt;
+      if (m.ang >= m.max) { m.ang = m.max; if (m.vel > .8) m.vel *= -.25; else { m.vel = 0; m.fini = true; } }
+    }
+    axeCh.set(m.dz, 0, -m.dx);
+    o.quaternion.copy(qCh.setFromAxisAngle(axeCh, m.ang)).multiply(m.yaw);
+    o.position.y = m.y0 + .15 * Math.sin(m.ang);
+    const k = Math.exp(-3 * m.t);
+    for (const l of m.membres) {   // membres qui ballottent puis se figent
+      const c = k * Math.cos(l.f * m.t);
+      l.o.rotation.x = l.xr + (l.x0 - l.xr) * c;
+      l.o.rotation.z = l.zr + (l.z0 - l.zr) * c;
+    }
+    if (m.t > 18.8) o.scale.setScalar(m.s0 * Math.max(.001, (20 - m.t) / 1.2));   // disparition progressive
+  }
+}
+function blesserEnnemi(obj, tete, dmg) {
+  obj.userData.pv -= dmg;
+  obj.userData.rec = .4;
+  sonTouche();
+  if (obj.userData.pv > 0) { montrer(tete ? "TÊTE" : "HIT", 150); return; }   // plus d'affichage des points de vie
+  const P = { normal: [150, 250], petit: [200, 300], militaire: [300, 450], tank: [400, 550], boss: [1200, 1800] }[obj.userData.sorte];
+  const pts = tete ? P[1] : P[0];
+  score += pts;
+  mourir(obj, tete);
+  montrer((tete ? "HEADSHOT +" : "CORPS +") + pts, 200);
+}
+function essayerTir() {
+  if (!controls.isLocked || fin || enRechargement || enTrainDeCourir()) return;
+  const A = ARMES[armeIdx], now = performance.now() / 1000;
+  if (now - dernierTir < A.delay) return;
+  if (!tricheMunitions && chargeurs[armeIdx] <= 0) { lancerRechargement(); return; }
+  if (!tricheMunitions) chargeurs[armeIdx]--;
+  dernierTir = now; recul = A.recul; tFlash = .05;
+  A.pellets > 1 ? sonPompe() : sonTir();
+  const prec = (touches["control"] || touches["c"]) ? .45 : 1;
+  const deja = new Set();
+  for (let p = 0; p < A.pellets; p++) {
+    const sx = (Math.random() - .5) * 2 * A.spread * prec;
+    const sy = (Math.random() - .5) * 2 * A.spread * prec;
+    raycaster.setFromCamera(new THREE.Vector2(sx, sy), camera);
+    raycaster.far = 100;
+    const touche = raycaster.intersectObjects([...solides, ...cibles, ...ennemis], true)[0];
+    if (!touche) continue;
+    let obj = touche.object;
+    while (obj && !obj.userData.type) obj = obj.parent;
+    if (!obj) { impact(touche); continue; }
+    const tete = touche.point.y - obj.position.y > 1.55 * obj.scale.y;
+    const dmg = tete ? A.dmgTete : A.dmg;
+    if (obj.userData.type === "cible") {
+      if (deja.has(obj)) continue;
+      deja.add(obj);
+      tuerCible(obj, tete);
+    } else blesserEnnemi(obj, tete, dmg);
+  }
+  afficher();
+}
+document.addEventListener("mousedown", (e) => { if (e.button === 0) { clicMaintenu = true; essayerTir(); } });
+document.addEventListener("mouseup", (e) => { if (e.button === 0) clicMaintenu = false; });
+document.addEventListener("wheel", (e) => {
+  if (!controls.isLocked || fin) return;
+  changerArme((armeIdx + (e.deltaY > 0 ? 1 : ARMES.length - 1)) % ARMES.length);
+});
+
+// ---------- Boucle principale ----------
+let fpsN = 0, fpsT = performance.now();
+const horloge = new THREE.Clock();
+function animer() {
+  requestAnimationFrame(animer);
+  const dt = Math.min(horloge.getDelta(), .1);
+  const maintenant = performance.now();
+  const dedans = !!interieurDe(camera.position.x, camera.position.z) && camera.position.y - hCam < 2 * ETAGE + .2;
+  if (dedans !== dansMaison) {
+    dansMaison = dedans;
+    scene.fog.density = dedans ? .002 : [.045, .03, .02][Q];
+    nappesBrouillard.forEach((n) => { n.sprite.visible = !dedans; });
+  }
+  lumieresAmbiance.forEach((l) => {
+    l.lumiere.intensity = l.intensite * (1 + Math.sin(maintenant * .013 + l.phase) * l.variation);
+  });
+  nappesBrouillard.forEach((n) => {
+    n.sprite.position.set(n.x + Math.sin(maintenant * .00012 + n.phase) * .8,
+      n.y + Math.sin(maintenant * .00035 + n.phase) * .22,
+      n.z + Math.cos(maintenant * .0001 + n.phase) * .5);
+  });
+  flammes.forEach((f) => {
+    const pulse = .8 + Math.sin(maintenant * .018 + f.phase) * .15;
+    f.mesh.scale.set(.8 + pulse * .25, pulse, .8 + pulse * .25);
+    f.mesh.rotation.y += dt * 1.2;
+    f.lumiere.intensity = 1.6 * (1 + Math.sin(maintenant * .027 + f.phase) * .35);
+  });
+  recul *= .85;
+  const avanc = enRechargement ? Math.min(1, (performance.now() - debutRecharge) / 1200) : 0;
+  const bas = Math.sin(avanc * Math.PI);   // l'arme descend puis remonte pendant le rechargement
+  const courseActive = controls.isLocked && !fin && enTrainDeCourir();
+  poseCourse += ((courseActive ? 1 : 0) - poseCourse) * Math.min(1, dt * 8);
+  if (courseActive) phaseCourse += dt * 10;
+  const balancement = Math.sin(phaseCourse), rebond = Math.abs(Math.sin(phaseCourse * 2));
+  arme.position.set(
+    POS_ARME.x + balancement * .045 * poseCourse,
+    POS_ARME.y - bas * .25 - poseCourse * .27 + rebond * .035 * poseCourse,
+    POS_ARME.z + recul + poseCourse * .12
+  );
+  arme.rotation.set(
+    -recul * 3 - bas * .9 - poseCourse * .25,
+    balancement * .1 * poseCourse,
+    bas * .5 + balancement * .12 * poseCourse
+  );
+  tFlash -= dt; flash.visible = tFlash > 0; flash.scale.setScalar(.7 + Math.random() * .8);
+  fpsN++;
+  if (maintenant - fpsT > 500) { maj("fps", Math.round(fpsN * 1000 / (maintenant - fpsT))); fpsN = 0; fpsT = maintenant; }
+
+  const tt = performance.now() / 1000;
+  lumieres.forEach((l) => {
+    const u = l.userData;
+    if (!u.scint) return;
+    u.prochainScintillement -= dt;
+    u.scintillementBref = Math.max(0, u.scintillementBref - dt);
+    if (u.prochainScintillement <= 0) {
+      u.scintillementBref = .08 + Math.random() * .2;
+      u.prochainScintillement = 3 + Math.random() * 8;
+    }
+    const lent = Math.sin(tt * .35 + u.phaseLente) * .025;
+    const rapide = Math.sin(tt * u.vitesseScint + u.phase) * u.amplitudeScint;
+    const baisse = u.scintillementBref > 0 ? .35 * (u.scintillementBref / .28) : 0;
+    l.intensity = u.base * (1 + lent + rapide - baisse);
+  });
+  animerFumee(dt);
+
+  if (controls.isLocked && !fin) {
+    // Déplacement, collisions, hauteur (escalier / étage)
+    const veutCrouch = !!(touches["control"] || touches["c"]);
+    hCam += ((veutCrouch ? 1.05 : HJ) - hCam) * Math.min(1, dt * 12);
+    boostVit = Math.max(0, boostVit - dt);
+    const avance = !!(touches["z"] || touches["w"] || touches["s"]);
+    const cote = !!(touches["q"] || touches["a"] || touches["d"]);
+    let v = (veutCrouch ? 4.2 : touches["shift"] ? 8.5 : 5.2) * dt;
+    if (boostVit > 0) v *= 1.35;
+    if (avance && cote) v *= Math.SQRT1_2;
+    if (touches["z"] || touches["w"]) controls.moveForward(v);
+    if (touches["s"]) controls.moveForward(-v);
+    if (touches["d"]) controls.moveRight(v);
+    if (touches["q"] || touches["a"]) controls.moveRight(-v);
+    let fy = camera.position.y - hCam;
+    pousser(camera.position, .45, fy, hCam);
+    camera.position.x = Math.max(-L + .5, Math.min(L - .5, camera.position.x));
+    camera.position.z = Math.max(-L + .5, Math.min(L - .5, camera.position.z));
+    const solH = hauteurSol(camera.position.x, camera.position.z, fy);
+    if (touches[" "] && auSol) { vy = 7.4; auSol = false; }
+    fy += vy * dt;
+    vy -= 26 * dt;
+    if (fy <= solH) { fy = solH; vy = 0; auSol = true; }
+    else auSol = false;
+    camera.position.y = fy + hCam;
+    const dedans = maisonDe(camera.position.x, camera.position.z);   // brouillard léger dans les maisons
+    scene.fog.density += ((dedans ? .006 : .03) - scene.fog.density) * Math.min(1, dt * 3);
+    if (clicMaintenu && ARMES[armeIdx].auto) essayerTir();
+
+    // Changement d'étage : les ennemis réapparaissent au bon niveau
+    const n = fy > ETAGE - .6 ? 1 : 0;
+    if (n !== niveau) {
+      niveau = n;
+      spawnes -= ennemis.length;
+      ennemis.forEach((e) => scene.remove(e)); ennemis.length = 0;
+      delaiEnnemi = 1.5; champT = 0;
+    }
+
+    if (mode === "chrono") {
+      temps -= dt;
+      if (temps <= 0) { temps = 0; afficher(); terminer("Temps écoulé !"); }
+    } else if (pauseVague > 0) pauseVague -= dt;
+    else if (tues >= nbVague()) {   // vague terminée : bonus, vague suivante
+      score += 100 * vague; vague++; spawnes = 0; tues = 0; pauseVague = 4; bossCetteVague = false;
+      if (vague % 3 === 1 && vies < 5) vies++;
+      montrer("VAGUE " + vague + " !");
+    }
+    if (mode === "vagues" && pauseVague <= 0 && vague % 5 === 0 && !bossCetteVague) {
+      creerBoss(); bossCetteVague = true;
+    }
+
+    animerCadavres(dt);
+    // Cibles : elles se promènent au sol et rebondissent
+    cibles.forEach((c) => {
+      const u = c.userData;
+      c.position.x += u.vx * dt; c.position.z += u.vz * dt;
+      if (pousser(c.position, .5, 0) || Math.abs(c.position.x) > L - 1.5 || Math.abs(c.position.z) > L - 1.5) { u.vx *= -1; u.vz *= -1; }
+      c.position.x = Math.max(-L + 1.5, Math.min(L - 1.5, c.position.x));
+      c.position.z = Math.max(-L + 1.5, Math.min(L - 1.5, c.position.z));
+    });
+
+    // Ennemis : ils suivent la carte de chemins et contournent les obstacles
+    const d = difficulte(), vit = 2.6 + 2.2 * d;
+    champT -= dt;
+    if (champT <= 0) { calculerChamp(); champT = .35; }
+    delaiEnnemi -= dt;
+    const maxE = mode === "vagues" ? Math.min(28, 3 + 2 * vague) : 4 + Math.round(4 * d);
+    if (delaiEnnemi <= 0 && pauseVague <= 0 && ennemis.length < maxE && (mode === "chrono" || spawnes < nbVague())) {
+      creerEnnemi(); delaiEnnemi = mode === "vagues" ? Math.max(.4, 2.2 - .15 * vague) : Math.max(.8, 3 - 1.5 * d);
+    }
+    const mp = niveau ? maisonDe(camera.position.x, camera.position.z) : null;
+    for (let i = ennemis.length - 1; i >= 0; i--) {
+      const e = ennemis[i], u = e.userData, ey = e.position.y;
+      const cible = prochainPoint(e) || [camera.position.x, camera.position.z];
+      const dx = cible[0] - e.position.x, dz = cible[1] - e.position.z;
+      const lg = Math.max(Math.hypot(dx, dz), .001);
+      const dist = Math.hypot(camera.position.x - e.position.x, camera.position.z - e.position.z);
+      const arret = u.sorte === "militaire" && u.stop && dist < 14;   // le militaire s'arrête pour tirer
+      const pas = arret ? 0 : vit * u.k * dt, nb = Math.max(1, Math.ceil(pas / .08));
+      for (let p = 0; p < nb; p++) {
+        e.position.x += dx / lg * pas / nb; pousser(e.position, .45, ey);
+        e.position.z += dz / lg * pas / nb; pousser(e.position, .45, ey);
+      }
+      e.lookAt(arret ? camera.position.x : cible[0], ey, arret ? camera.position.z : cible[1]);
+      animerZombie(e, dt, pas, arret);
+      if (u.sorte === "militaire" || u.sorte === "boss") {
+        u.tir -= dt;
+        const portee = u.sorte === "boss" ? 36 : 28;
+        if (u.tir <= 0 && dist < portee) {
+          const o = new THREE.Vector3(e.position.x, ey + 1.3, e.position.z);
+          const dir = new THREE.Vector3(camera.position.x, camera.position.y - .3, camera.position.z).sub(o), lon = dir.length();
+          dir.normalize();
+          raycaster.set(o, dir); raycaster.far = lon;
+          u.stop = !raycaster.intersectObjects(solides, false).length;   // ligne de vue dégagée ?
+          if (u.stop) { tirerBalle(o.addScaledVector(dir, .6), dir); u.tir = u.sorte === "boss" ? 1.1 + Math.random() * .4 : 2 + Math.random(); u.rec = .5; } else u.tir = .5;
+        }
+      }
+
+      // Bloqué derrière un mur depuis 2 s : il réapparaît ailleurs
+      u.t = (u.t || 0) + dt;
+      if (u.t > 2) {
+        if (u.px !== undefined && Math.hypot(e.position.x - u.px, e.position.z - u.pz) < .6) {
+          const [x, z, f] = placer(mp ? 5 : 20, mp); e.position.set(x, f, z);
+        }
+        u.t = 0; u.px = e.position.x; u.pz = e.position.z;
+      }
+
+      if (dist < 1.1 + .45 * e.scale.y && Math.abs(ey - fy) < 1.5) {
+        scene.remove(e); ennemis.splice(i, 1); tues++;
+        if (!tricheInvincible) {
+          vies--; sonDegat();
+          degats.style.opacity = 1;
+          setTimeout(() => (degats.style.opacity = 0), 150);
+          if (vies <= 0) { afficher(); terminer("Tu as été éliminé !"); break; }
+        }
+      }
+    }
+    for (let i = projectiles.length - 1; i >= 0 && !fin; i--) {
+      const b = projectiles[i], q = b.userData, p = b.position;
+      let fini = (q.vie -= dt) <= 0;
+      for (let k = 0; k < 2 && !fini; k++) {   // 2 sous-pas : pas de traversée des murs fins
+        p.addScaledVector(q.v, dt / 2);
+        fini = p.y < 0 || proches(p.x, p.z).some((o) => p.y > o.minY && p.y < o.maxY && p.x > o.minX && p.x < o.maxX && p.z > o.minZ && p.z < o.maxZ);
+      }
+      const atteint = !fini && Math.hypot(p.x - camera.position.x, p.z - camera.position.z) < .6 && p.y > camera.position.y - hCam && p.y < camera.position.y + .2;
+      if (fini || atteint) { scene.remove(b); projectiles.splice(i, 1); }
+      if (atteint && blesser()) break;
+    }
+    const tBob = performance.now() / 1000;
+    for (const p of pickups) {
+      if (p.userData.mort) continue;
+      p.rotation.y += dt * 1.6;
+      p.position.y = p.userData.fy + .55 + Math.sin(tBob * 3 + p.position.x) * .12;
+      if (Math.hypot(p.position.x - camera.position.x, p.position.z - camera.position.z) < 1.2 && Math.abs((camera.position.y - hCam) - p.userData.fy) < 1.4) {
+        p.userData.mort = true; p.visible = false; sonBonus();
+        const tp = p.userData.type;
+        if (tp === "soin") { vies = Math.min(5, vies + 1); montrer("SOIN +1", 900); }
+        else if (tp === "munitions") {
+          reserves[0] += 24; reserves[1] += 6;
+          montrer("MUNITIONS", 900);
+        } else { boostVit = 8; montrer("VITESSE !", 900); }
+        const ud = p.userData;
+        setTimeout(() => {
+          p.position.set(ud.x, ud.fy + .55, ud.z);
+          p.visible = true; p.userData.mort = false;
+        }, 16000);
+      }
+    }
+    afficher();
+  }
+  renderer.render(scene, camera);
+}
+animer();
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
